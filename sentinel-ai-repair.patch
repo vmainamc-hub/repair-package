@@ -1,0 +1,1142 @@
+diff --git a/src/pages/sentinel-ai/__tests__/sentinel-ai-runner.test.ts b/src/pages/sentinel-ai/__tests__/sentinel-ai-runner.test.ts
+index e0a2714..7fe940b 100644
+--- a/src/pages/sentinel-ai/__tests__/sentinel-ai-runner.test.ts
++++ b/src/pages/sentinel-ai/__tests__/sentinel-ai-runner.test.ts
+@@ -1,5 +1,6 @@
+ import type { RankedOpportunity } from '@/sentinel-engine/lib/apex/types';
+-import type { EngineSample, SentinelAiEngine } from '../sentinel-ai-engine-types';
++import { TradeRequestError } from '@/utils/trade-errors';
++import type { EngineSample, SentinelAiEngine, SignalExclusion } from '../sentinel-ai-engine-types';
+ import { MODULE_ID, SentinelAiRunner, type RunnerIO, type RunnerStores } from '../sentinel-ai-runner';
+ import { DEFAULT_SETTINGS, type SentinelAiSettings } from '../sentinel-ai-types';
+ 
+@@ -33,6 +34,7 @@ class FakeEngine implements SentinelAiEngine {
+     digits: Record<string, number | null> = {};
+     listeners = new Set<(symbol: string) => void>();
+     retained = 0;
++    failsafes: string[] = [];
+ 
+     retain() {
+         this.retained += 1;
+@@ -41,10 +43,18 @@ class FakeEngine implements SentinelAiEngine {
+         };
+     }
+ 
+-    sample(): EngineSample {
++    sample(exclude?: SignalExclusion): EngineSample {
++        const hidden = Boolean(this.surfaced && exclude?.(this.surfaced.symbol, String(this.surfaced.contract.id)));
+         return {
+-            info: { status: 'live', online: 20, total: 20, degraded: false, failsafes: [], dangerLabel: 'CALM' },
+-            surfaced: this.surfaced,
++            info: {
++                status: 'live',
++                online: 20,
++                total: 20,
++                degraded: this.failsafes.length > 0,
++                failsafes: this.failsafes,
++                dangerLabel: 'CALM',
++            },
++            surfaced: hidden ? null : this.surfaced,
+         };
+     }
+ 
+@@ -472,3 +482,203 @@ describe('SentinelAiRunner', () => {
+         expect(local.engine.retained).toBe(0);
+     });
+ });
++
++describe('SentinelAiRunner: Immediate mode', () => {
++    let h: Harness | null = null;
++    afterEach(() => {
++        h?.cleanup();
++        h = null;
++    });
++
++    it('trades a live signal right away, without waiting for the entry digit', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.surface(opportunity('UNDER7', 4));
++        h.runner.start();
++        await flush();
++
++        expect(h.buy.mock.calls.length).toBe(1); // no tick was ever printed
++        expect(h.buy.mock.calls[0][0].parameters.contract_type).toBe('DIGITUNDER');
++        expect(h.runner.getSnapshot().session.trades).toBe(1);
++    });
++
++    it('trades even when the engine has no validated entry digit', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.surface(opportunity('UNDER7', null));
++        h.runner.start();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(1);
++    });
++
++    it('trades a signal that arrives after Run was pressed', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.runner.start();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(0);
++
++        h.surface(opportunity('OVER2', 5));
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(1);
++        expect(h.buy.mock.calls[0][0].parameters.contract_type).toBe('DIGITOVER');
++    });
++
++    it('takes every run of a signal back to back, one at a time', async () => {
++        h = makeHarness({ executionMode: 'immediate', runsPerSignal: 3 });
++        h.surface(opportunity('UNDER7', 4));
++        h.runner.start();
++        await flush();
++        await flush();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(3);
++        expect(h.runner.getSnapshot().runsDone).toBe(3);
++    });
++
++    it('requires no entry digit', () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.surface(opportunity('UNDER7', 4));
++        expect(h.runner.getSnapshot().requiredDigit).toBeNull();
++    });
++
++    it('does not trade blind while the engine reports a stale feed', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.engine.failsafes = ['FEED STALE'];
++        h.surface(opportunity('UNDER7', 4));
++        h.runner.start();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(0);
++
++        h.engine.failsafes = [];
++        h.loop();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(1);
++    });
++
++    it('leaves the default entry-digit behaviour untouched', async () => {
++        h = makeHarness();
++        h.surface(opportunity('UNDER7', 4));
++        h.runner.start();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(0);
++        expect(h.runner.getSnapshot().signalState).toBe('WAITING_ENTRY');
++    });
++});
++
++describe('SentinelAiRunner: failed purchases', () => {
++    let h: Harness | null = null;
++    afterEach(() => {
++        h?.cleanup();
++        h = null;
++    });
++
++    const rejected = () =>
++        new TradeRequestError('Unknown contract proposal (InvalidContractProposal)', {
++            stage: 'proposal',
++            kind: 'rejected',
++            code: 'InvalidContractProposal',
++        });
++
++    it('skips a contract Deriv refuses and keeps the session running', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.buy.mockRejectedValueOnce(rejected());
++        h.surface(opportunity('UNDER8', 4, 'JD50'));
++        h.runner.start();
++        await flush();
++
++        expect(h.runner.isRunning()).toBe(true);
++        const snap = h.runner.getSnapshot();
++        expect(snap.history[0].outcome).toBe('SKIPPED');
++        expect(snap.lastError).toMatch(/Skipped Under 8/);
++        expect(h.buy.mock.calls.length).toBe(1);
++
++        // The refused cell is hidden from the feed; the next signal trades normally.
++        h.loop();
++        h.surface(opportunity('UNDER7', 4, SYMBOL));
++        await flush();
++        expect(h.runner.isRunning()).toBe(true);
++        expect(h.buy.mock.calls.length).toBe(2);
++        expect(h.runner.getSnapshot().session.trades).toBe(1);
++    });
++
++    it('does not re-offer a refused cell until its block lapses', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.buy.mockRejectedValueOnce(rejected());
++        h.surface(opportunity('UNDER8', 4, 'JD50'));
++        h.runner.start();
++        await flush();
++        h.loop();
++        h.loop();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(1);
++
++        h.advance(6 * 60_000);
++        h.surface(opportunity('UNDER8', 4, 'JD50'));
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(2);
++    });
++
++    it('stops with a clear reason if Deriv keeps refusing every signal', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.buy.mockImplementation(async () => {
++            throw rejected();
++        });
++        h.runner.start();
++        for (let i = 0; i < 8 && h.runner.isRunning(); i += 1) {
++            h.surface(opportunity(`UNDER${i + 1}`, 4, 'JD50'));
++            await flush();
++        }
++        expect(h.runner.isRunning()).toBe(false);
++        expect(h.runner.getSnapshot().stopReason).toMatch(/refused 6 signals in a row/);
++    });
++
++    it('never retries a purchase whose outcome is unknown', async () => {
++        h = makeHarness({ executionMode: 'immediate', runsPerSignal: 3 });
++        h.buy.mockRejectedValueOnce(
++            new TradeRequestError('Purchase request timed out. The result is unknown.', {
++                stage: 'buy',
++                kind: 'timeout',
++                outcomeUnknown: true,
++            })
++        );
++        h.surface(opportunity('UNDER7', 4));
++        h.runner.start();
++        await flush();
++        h.loop();
++        await flush();
++
++        expect(h.runner.isRunning()).toBe(false);
++        expect(h.runner.getSnapshot().stopReason).toMatch(/unknown/i);
++        expect(h.buy.mock.calls.length).toBe(1);
++    });
++
++    it('stops on an account error', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.buy.mockRejectedValueOnce(new Error('Your account has insufficient balance.'));
++        h.surface(opportunity('UNDER7', 4));
++        h.runner.start();
++        await flush();
++        expect(h.runner.isRunning()).toBe(false);
++        expect(h.runner.getSnapshot().stopReason).toMatch(/insufficient balance/i);
++    });
++
++    it('retries a transient failure after a cool-down, then gives up after 3', async () => {
++        h = makeHarness({ executionMode: 'immediate' });
++        h.buy.mockImplementation(async () => {
++            throw new Error('Network hiccup');
++        });
++        h.surface(opportunity('UNDER7', 4));
++        h.runner.start();
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(1);
++
++        h.loop(); // still inside the cool-down: no hammering
++        await flush();
++        expect(h.buy.mock.calls.length).toBe(1);
++
++        for (let i = 0; i < 2; i += 1) {
++            h.advance(3_100);
++            h.loop();
++            await flush();
++        }
++        expect(h.buy.mock.calls.length).toBe(3);
++        expect(h.runner.isRunning()).toBe(false);
++    });
++});
+diff --git a/src/pages/sentinel-ai/sentinel-ai-engine-types.ts b/src/pages/sentinel-ai/sentinel-ai-engine-types.ts
+index be2be33..0b52a82 100644
+--- a/src/pages/sentinel-ai/sentinel-ai-engine-types.ts
++++ b/src/pages/sentinel-ai/sentinel-ai-engine-types.ts
+@@ -9,11 +9,14 @@ export type EngineSample = {
+     surfaced: RankedOpportunity | null;
+ };
+ 
++/** Lets the runner keep a cell out of the feed (e.g. Deriv refused that contract) so the next-best signal surfaces. */
++export type SignalExclusion = (symbol: string, contractId: string) => boolean;
++
+ export interface SentinelAiEngine {
+     /** Starts continuous analysis (reference-counted by the engine). Returns the release function. */
+     retain(): () => void;
+     /** Samples the engine's current state. Cheap enough to call about once per second. */
+-    sample(): EngineSample;
++    sample(exclude?: SignalExclusion): EngineSample;
+     /** Calls back after every tick of every analysed market (symbol only; read the digit via getLastDigit). */
+     onTick(callback: (symbol: string) => void): () => void;
+     /** The most recent printed digit for a market, or null when nothing has printed yet. */
+diff --git a/src/pages/sentinel-ai/sentinel-ai-engine.ts b/src/pages/sentinel-ai/sentinel-ai-engine.ts
+index 59dadcb..b590f5d 100644
+--- a/src/pages/sentinel-ai/sentinel-ai-engine.ts
++++ b/src/pages/sentinel-ai/sentinel-ai-engine.ts
+@@ -7,7 +7,7 @@ import { apexCore, APEX_UNIVERSE } from '@/sentinel-engine/lib/apex/core';
+ import { DEFAULT_SCAN_OPTIONS, globalDanger, rankOpportunities } from '@/sentinel-engine/lib/apex/scan';
+ import { selectSurfacedOpportunity } from '@/sentinel-engine/lib/apex/surface-vetting';
+ import { derivBus } from '@/sentinel-engine/lib/deriv/tick-bus';
+-import type { SentinelAiEngine, EngineSample } from './sentinel-ai-engine-types';
++import type { SentinelAiEngine, EngineSample, SignalExclusion } from './sentinel-ai-engine-types';
+ import type { EngineInfo } from './sentinel-ai-types';
+ 
+ // Same fail-safe thresholds the Forge used, so "no signal" can be told apart from "cannot see".
+@@ -16,6 +16,11 @@ const FEED_STALE_MS = 12_000;
+ const ENGINE_BUSY_MS = 450;
+ const API_POLL_MS = 500;
+ const HEALTH_POLL_MS = 4_000;
++// Self-healing: a feed that stays unhealthy this long is re-synced, then fully re-attached on the next try.
++const RECOVER_AFTER_MS = 20_000;
++const RECOVER_COOLDOWN_MS = 30_000;
++const WARMUP_MS = 30_000;
++const UNHEALTHY = ['FEED STALE', 'ANALYSIS LAG', 'BACKEND DEGRADED'];
+ 
+ const dangerLabel = (value: number) => (value < 35 ? 'CALM' : value < 65 ? 'ELEVATED' : 'HOSTILE');
+ 
+@@ -41,6 +46,13 @@ class RealSentinelAiEngine implements SentinelAiEngine {
+     private pollTimer: number | null = null;
+     private healthTimer: number | null = null;
+     private lastSampleCostMs = 0;
++    private lastFailsafes: string[] = [];
++    private lastOnline = 0;
++    private lastTotal = 0;
++    private attachedAt = 0;
++    private badSince = 0;
++    private lastRecoverAt = 0;
++    private recoveries = 0;
+ 
+     retain() {
+         this.holders += 1;
+@@ -79,6 +91,8 @@ class RealSentinelAiEngine implements SentinelAiEngine {
+         }
+         if (this.boundApi && this.boundApi !== api) resetBusListener();
+         this.boundApi = api;
++        this.attachedAt = Date.now();
++        this.badSince = 0;
+         this.releaseCore = apexCore.subscribe(() => {});
+     }
+ 
+@@ -87,25 +101,65 @@ class RealSentinelAiEngine implements SentinelAiEngine {
+         this.releaseCore = null;
+     }
+ 
+-    /** Re-attaches when the Deriv socket instance was replaced or the engine reports an error state. */
++    /**
++     * Re-attaches when the Deriv socket instance was replaced or the engine reports an error state, and self-heals
++     * a feed that silently went quiet (dropped subscriptions, stalled analysis, backgrounded tab).
++     */
+     private healthCheck() {
+         if (this.holders === 0) return;
+         const api = (api_base as { api?: unknown }).api;
+         const replaced = Boolean(api) && Boolean(this.boundApi) && api !== this.boundApi;
+         const errored = apexCore.getStatus() === 'error' && Boolean(api);
+-        if (!replaced && !errored) return;
+-        this.detach();
+-        if (replaced) resetBusListener();
+-        this.attach();
++        if (replaced || errored) {
++            this.detach();
++            if (replaced) resetBusListener();
++            this.attach();
++            return;
++        }
++        this.recoverIfStalled(Boolean(api));
+     }
+ 
+-    sample(): EngineSample {
++    private recoverIfStalled(hasApi: boolean) {
++        const now = Date.now();
++        if (!hasApi || now - this.attachedAt < WARMUP_MS) {
++            this.badSince = 0;
++            return;
++        }
++        const tooFewMarkets = this.lastTotal > 0 && this.lastOnline < Math.ceil(this.lastTotal * 0.4);
++        const unhealthy = this.lastFailsafes.some(flag => UNHEALTHY.includes(flag)) || tooFewMarkets;
++        if (!unhealthy) {
++            this.badSince = 0;
++            return;
++        }
++        if (!this.badSince) this.badSince = now;
++        if (now - this.badSince < RECOVER_AFTER_MS || now - this.lastRecoverAt < RECOVER_COOLDOWN_MS) return;
++
++        this.recoveries += 1;
++        this.lastRecoverAt = now;
++        this.badSince = 0;
++        // First attempt is gentle (re-subscribe every market's ticks on the current socket); if the feed is still
++        // bad on the next attempt, drop and rebuild the whole engine attachment.
++        if (this.recoveries % 2 === 1) {
++            console.warn('[sentinel-ai] feed unhealthy, re-syncing tick streams', this.lastFailsafes);
++            void derivBus.resync();
++        } else {
++            console.warn('[sentinel-ai] feed still unhealthy, re-attaching the engine', this.lastFailsafes);
++            this.detach();
++            resetBusListener();
++            this.attach();
++        }
++    }
++
++    sample(exclude?: SignalExclusion): EngineSample {
+         const t0 = Date.now();
+         const intels = apexCore.getAll();
+         this.lastSampleCostMs = Date.now() - t0;
+ 
+         const ranked = rankOpportunities(intels, DEFAULT_SCAN_OPTIONS).ranked;
+-        const surfaced = selectSurfacedOpportunity(ranked);
++        // Cells Deriv refused are filtered BEFORE the engine's own surfacing rule runs, so the next-best signal
++        // surfaces through the same gate instead of the feed getting stuck on a contract that cannot be bought.
++        const eligible = exclude ? ranked.filter(opp => !exclude(opp.symbol, String(opp.contract.id))) : ranked;
++        const surfaced = selectSurfacedOpportunity(eligible);
+         const gd = globalDanger(intels);
+ 
+         const rawStatus = apexCore.getStatus();
+@@ -124,6 +178,10 @@ class RealSentinelAiEngine implements SentinelAiEngine {
+             failsafes.push('BACKEND DEGRADED');
+         }
+ 
++        this.lastFailsafes = failsafes;
++        this.lastOnline = online;
++        this.lastTotal = APEX_UNIVERSE.length;
++
+         return {
+             info: {
+                 status,
+diff --git a/src/pages/sentinel-ai/sentinel-ai-runner.ts b/src/pages/sentinel-ai/sentinel-ai-runner.ts
+index bf9af8b..89a1577 100644
+--- a/src/pages/sentinel-ai/sentinel-ai-runner.ts
++++ b/src/pages/sentinel-ai/sentinel-ai-runner.ts
+@@ -8,6 +8,7 @@
+ // It is a singleton service (not tied to a mounted page), so a session keeps running while you look at
+ // other tabs. All I/O is injected, which keeps it unit-testable.
+ import { contract_stages } from '@/constants/contract-stage';
++import { describeTradeFailure } from '@/utils/trade-errors';
+ import type { RankedOpportunity } from '@/sentinel-engine/lib/apex/types';
+ import type { SentinelAiEngine } from './sentinel-ai-engine-types';
+ import { initialStakeState, nextStakeState, requiredEntryDigit, sessionStopReason } from './sentinel-ai-money';
+@@ -33,6 +34,12 @@ const TRADE_LIMIT = 40;
+ const LOOP_MS = 1000;
+ const EMIT_THROTTLE_MS = 120;
+ const MAX_CONSECUTIVE_BUY_ERRORS = 3;
++/** A contract Deriv refused stays out of the feed for this long (market hours / offerings change, so not forever). */
++const BLOCK_TTL_MS = 5 * 60_000;
++/** Stop (instead of looping silently) when Deriv refuses this many signals in a row without a single purchase. */
++const MAX_SKIPS_IN_A_ROW = 6;
++/** Pause after a transient failure so Immediate mode cannot hammer the API. */
++const RETRY_COOLDOWN_MS = 3_000;
+ 
+ type Loose = Record<string, any>;
+ 
+@@ -110,8 +117,6 @@ const EMPTY_ENGINE: EngineInfo = {
+     dangerLabel: 'CALM',
+ };
+ 
+-const FATAL_BUY_ERROR = /balance|authori[sz]|not logged|log in|insufficient|account/i;
+-
+ export class SentinelAiRunner {
+     private readonly io: RunnerIO;
+     private stores: RunnerStores | null = null;
+@@ -138,6 +143,10 @@ export class SentinelAiRunner {
+     private lastKey: string | null = null;
+     private tradeInFlight = false;
+     private buyErrors = 0;
++    private skipStreak = 0;
++    private cooldownUntil = 0;
++    /** `${symbol}|${contractId}` -> time the block lapses. Cells Deriv refused this session. */
++    private blocked = new Map<string, number>();
+     private aborts = new Set<AbortController>();
+ 
+     private history: SignalRecord[] = [];
+@@ -220,6 +229,9 @@ export class SentinelAiRunner {
+         this.lastError = null;
+         this.stopReason = null;
+         this.buyErrors = 0;
++        this.skipStreak = 0;
++        this.cooldownUntil = 0;
++        this.blocked.clear();
+         this.session = this.freshSession();
+         this.runToken += 1;
+         this.running = true;
+@@ -256,6 +268,7 @@ export class SentinelAiRunner {
+             if (record && record.outcome === 'WATCHED') record.outcome = 'ACTIVE';
+         }
+         this.emit();
++        this.tryImmediate();
+     }
+ 
+     stop(reason = 'Stopped') {
+@@ -329,7 +342,7 @@ export class SentinelAiRunner {
+ 
+     private loop() {
+         try {
+-            const sample = this.io.engine.sample();
++            const sample = this.io.engine.sample((symbol, contractId) => this.isBlocked(`${symbol}|${contractId}`));
+             this.engineInfo = sample.info;
+             this.ingest(sample.surfaced);
+         } catch (error) {
+@@ -338,6 +351,17 @@ export class SentinelAiRunner {
+         }
+         this.checkExpiry();
+         this.emit();
++        this.tryImmediate();
++    }
++
++    private isBlocked(key: string) {
++        const until = this.blocked.get(key);
++        if (until === undefined) return false;
++        if (this.io.now() >= until) {
++            this.blocked.delete(key);
++            return false;
++        }
++        return true;
+     }
+ 
+     /** One NEW signal event per newly surfaced market × contract cell (same rule the Forge used). */
+@@ -422,7 +446,7 @@ export class SentinelAiRunner {
+ 
+     // ── entry trigger ────────────────────────────────────────────────────────────────────────────
+     private requiredDigit(): number | null {
+-        if (!this.active) return null;
++        if (!this.active || this.settings.executionMode === 'immediate') return null;
+         return requiredEntryDigit(this.active.signal.entryDigit, this.session.consecutiveLosses, this.settings);
+     }
+ 
+@@ -432,6 +456,10 @@ export class SentinelAiRunner {
+             return;
+         }
+         this.scheduleEmit();
++        if (this.settings.executionMode === 'immediate') {
++            this.tryImmediate();
++            return;
++        }
+         if (!this.running || this.tradeInFlight || active.done || active.expired) return;
+         if (this.io.now() >= active.expiresAt) {
+             this.checkExpiry();
+@@ -444,6 +472,24 @@ export class SentinelAiRunner {
+         void this.execute(required);
+     }
+ 
++    /**
++     * Immediate mode: trade the live signal right away instead of waiting for its entry digit. Still never trades
++     * blind: it holds off while a trade is in flight, during a retry cool-down, or while the engine reports that its
++     * market feed is stale.
++     */
++    private tryImmediate() {
++        if (!this.running || this.settings.executionMode !== 'immediate') return;
++        const active = this.active;
++        if (!active || active.done || active.expired || this.tradeInFlight) return;
++        if (this.io.now() < this.cooldownUntil) return;
++        if (this.io.now() >= active.expiresAt) {
++            this.checkExpiry();
++            return;
++        }
++        if (this.engineInfo.failsafes.includes('FEED STALE')) return;
++        void this.execute(active.signal.entryDigit);
++    }
++
+     // ── trade ────────────────────────────────────────────────────────────────────────────────────
+     private pushContract(data: Loose) {
+         if (!this.stores) return;
+@@ -457,7 +503,7 @@ export class SentinelAiRunner {
+         }
+     }
+ 
+-    private async execute(entryDigit: number) {
++    private async execute(entryDigit: number | null) {
+         const active = this.active;
+         if (!active) return;
+         const token = this.runToken;
+@@ -497,6 +543,7 @@ export class SentinelAiRunner {
+             const buy = await this.io.buy({ parameters, price: stake });
+             contractId = buy.contract_id;
+             this.buyErrors = 0;
++            this.skipStreak = 0;
+             const opened: Loose = {
+                 ...baseContract,
+                 buy_price: buy.buy_price,
+@@ -549,20 +596,52 @@ export class SentinelAiRunner {
+             this.aborts.delete(abort);
+             this.tradeInFlight = false;
+             if (token !== this.runToken) return;
+-            const message =
+-                error instanceof Error && error.message
+-                    ? error.message
+-                    : (error as { error?: { message?: string } })?.error?.message || 'Contract purchase failed.';
+-            this.lastError = message;
++            // The purchase went through but something after it failed: never count that as a failed buy.
++            if (contractId) {
++                this.lastError = 'Lost track of the open contract; its result was not recorded. Check your Deriv statement.';
++                this.finishTrade(contractId, null, active);
++                return;
++            }
++            const failure = describeTradeFailure(error);
++            this.lastError = failure.message;
++
++            // A purchase was sent and never answered: it may exist. Never retry; stop and tell the user.
++            if (failure.outcomeUnknown || failure.kind === 'fatal') {
++                this.stop(`Stopped: ${failure.message}`);
++                return;
++            }
++            // Deriv explicitly refused this contract (nothing was bought): drop the signal, keep the session alive.
++            if (failure.kind === 'rejected') {
++                this.skipSignal(active, failure.message);
++                return;
++            }
+             this.buyErrors += 1;
+-            if (FATAL_BUY_ERROR.test(message) || this.buyErrors >= MAX_CONSECUTIVE_BUY_ERRORS) {
+-                this.stop(`Stopped: ${message}`);
++            this.cooldownUntil = this.io.now() + RETRY_COOLDOWN_MS;
++            if (this.buyErrors >= MAX_CONSECUTIVE_BUY_ERRORS) {
++                this.stop(`Stopped after ${this.buyErrors} failed attempts: ${failure.message}`);
+                 return;
+             }
+             this.emit();
+         }
+     }
+ 
++    /** Deriv refused this exact contract. Block it for a while so the next-best signal can surface. */
++    private skipSignal(active: ActiveSignal, message: string) {
++        const { signal } = active;
++        this.blocked.set(signal.key, this.io.now() + BLOCK_TTL_MS);
++        this.skipStreak += 1;
++        active.done = true;
++        const record = this.history.find(r => r.signal.id === signal.id);
++        if (record) record.outcome = 'SKIPPED';
++        this.lastError = `Skipped ${signal.label} on ${signal.marketName}: ${message}`;
++        if (this.skipStreak >= MAX_SKIPS_IN_A_ROW) {
++            this.stop(`Stopped: Deriv refused ${this.skipStreak} signals in a row. Last: ${message}`);
++            return;
++        }
++        if (this.pending) this.activate(this.pending);
++        this.emit();
++    }
++
+     private recordTrade(trade: TradeRecord) {
+         this.trades = [trade, ...this.trades].slice(0, TRADE_LIMIT);
+     }
+@@ -614,6 +693,7 @@ export class SentinelAiRunner {
+             active.expiresAt = this.io.now() + this.settings.signalWaitSeconds * 1000;
+         }
+         this.emit();
++        this.tryImmediate();
+     }
+ 
+     // ── snapshot ─────────────────────────────────────────────────────────────────────────────────
+@@ -644,6 +724,7 @@ export class SentinelAiRunner {
+             else if (active.expired) signalState = 'EXPIRED';
+             else if (this.tradeInFlight) signalState = 'TRADING';
+             else if (!this.running) signalState = 'WATCHING';
++            else if (this.settings.executionMode === 'immediate') signalState = 'READY';
+             else signalState = required === null ? 'NO_ENTRY_DIGIT' : 'WAITING_ENTRY';
+         }
+         const secondsLeft =
+diff --git a/src/pages/sentinel-ai/sentinel-ai-types.ts b/src/pages/sentinel-ai/sentinel-ai-types.ts
+index 820a41b..a019433 100644
+--- a/src/pages/sentinel-ai/sentinel-ai-types.ts
++++ b/src/pages/sentinel-ai/sentinel-ai-types.ts
+@@ -5,7 +5,14 @@
+ 
+ export type MartingaleMode = 'off' | 'after_1' | 'after_2' | 'custom';
+ 
++/**
++ * `entry_digit` (default): a signal waits for its entry digit to print, then buys.
++ * `immediate`: a signal is traded the moment it arrives; the entry digit is not waited for.
++ */
++export type ExecutionMode = 'entry_digit' | 'immediate';
++
+ export type SentinelAiSettings = {
++    executionMode: ExecutionMode;
+     /** Base stake per trade. */
+     stake: number;
+     martingaleMode: MartingaleMode;
+@@ -21,7 +28,7 @@ export type SentinelAiSettings = {
+     recoveryDigit: number;
+     /** After a win, keep the recovery stake until the session P/L is back above zero. */
+     recoverToBreakeven: boolean;
+-    /** How many consecutive trades are taken for each signal (each waits for the entry digit). */
++    /** How many consecutive trades are taken for each signal (each waits for the entry digit unless mode is immediate). */
+     runsPerSignal: number;
+     /** 0 = off. */
+     takeProfit: number;
+@@ -42,6 +49,7 @@ export type SentinelAiSettings = {
+ export const MIN_STAKE = 0.35;
+ 
+ export const DEFAULT_SETTINGS: SentinelAiSettings = {
++    executionMode: 'entry_digit',
+     stake: 1,
+     martingaleMode: 'after_1',
+     martingaleCustomLosses: 3,
+@@ -75,11 +83,15 @@ const num = (value: unknown, fallback: number, min: number, max: number, integer
+ const bool = (value: unknown, fallback: boolean) => (typeof value === 'boolean' ? value : fallback);
+ 
+ const MODES: MartingaleMode[] = ['off', 'after_1', 'after_2', 'custom'];
++const EXECUTION_MODES: ExecutionMode[] = ['entry_digit', 'immediate'];
+ 
+ /** Validates and clamps a (possibly partial / hand-edited / stale) settings object. */
+ export const normalizeSettings = (raw: unknown, base: SentinelAiSettings = DEFAULT_SETTINGS): SentinelAiSettings => {
+     const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+     return {
++        executionMode: EXECUTION_MODES.includes(r.executionMode as ExecutionMode)
++            ? (r.executionMode as ExecutionMode)
++            : base.executionMode,
+         stake: num(r.stake, base.stake, MIN_STAKE, 100000),
+         martingaleMode: MODES.includes(r.martingaleMode as MartingaleMode)
+             ? (r.martingaleMode as MartingaleMode)
+@@ -148,7 +160,7 @@ export type SentinelAiSignal = {
+     receivedAt: number;
+ };
+ 
+-export type SignalOutcome = 'ACTIVE' | 'TRADED' | 'EXPIRED' | 'REPLACED' | 'STOPPED' | 'WATCHED';
++export type SignalOutcome = 'ACTIVE' | 'TRADED' | 'EXPIRED' | 'REPLACED' | 'STOPPED' | 'WATCHED' | 'SKIPPED';
+ 
+ export type SignalRecord = {
+     signal: SentinelAiSignal;
+@@ -191,6 +203,7 @@ export type EngineInfo = {
+ export type RunnerStatus = 'IDLE' | 'WATCHING' | 'RUNNING';
+ 
+ export type ActiveSignalState =
++    | 'READY'
+     | 'WAITING_ENTRY'
+     | 'NO_ENTRY_DIGIT'
+     | 'TRADING'
+diff --git a/src/pages/sentinel-ai/sentinel-ai.tsx b/src/pages/sentinel-ai/sentinel-ai.tsx
+index c178b47..9468029 100644
+--- a/src/pages/sentinel-ai/sentinel-ai.tsx
++++ b/src/pages/sentinel-ai/sentinel-ai.tsx
+@@ -12,6 +12,7 @@ import { getNotificationPermission, requestNotificationPermission } from './sent
+ import { sentinelAiRunner } from './sentinel-ai-runner-instance';
+ import type {
+     ActiveSignalState,
++    ExecutionMode,
+     MartingaleMode,
+     SentinelAiSettings,
+     SentinelAiSignal,
+@@ -38,6 +39,7 @@ const OUTCOME_LABEL: Record<SignalOutcome, string> = {
+     REPLACED: 'Replaced',
+     STOPPED: 'Stopped',
+     WATCHED: 'Not traded',
++    SKIPPED: 'Skipped',
+ };
+ 
+ const stateText = (
+@@ -49,6 +51,8 @@ const stateText = (
+     runsTotal: number
+ ) => {
+     switch (state) {
++        case 'READY':
++            return 'Immediate mode: trading this signal now, without waiting for the entry digit.';
+         case 'WAITING_ENTRY':
+             return `Waiting for digit ${required}${recovering ? ' (recovery digit)' : ''} · ${secondsLeft}s left`;
+         case 'NO_ENTRY_DIGIT':
+@@ -56,7 +60,7 @@ const stateText = (
+         case 'TRADING':
+             return 'Trade in progress';
+         case 'WATCHING':
+-            return 'Not running. Press Run to trade this signal on its entry digit.';
++            return 'Not running. Press Run to trade this signal.';
+         case 'EXPIRED':
+             return 'Expired before the entry digit printed.';
+         case 'DONE':
+@@ -138,6 +142,11 @@ const Toggle = ({
+     </label>
+ );
+ 
++const EXECUTION_OPTIONS: Array<{ value: ExecutionMode; label: string; hint: string }> = [
++    { value: 'entry_digit', label: 'Wait for entry digit', hint: 'Each trade waits for the signal\'s entry digit to print' },
++    { value: 'immediate', label: 'Immediate', hint: 'Trades the moment a signal arrives, without waiting for the entry digit' },
++];
++
+ const MARTINGALE_OPTIONS: Array<{ value: MartingaleMode; label: string }> = [
+     { value: 'off', label: 'Off' },
+     { value: 'after_1', label: 'After 1 loss' },
+@@ -403,6 +412,27 @@ const SentinelAi = observer(() => {
+                         </div>
+ 
+                         <div className='sentinel-ai-col'>
++                            <fieldset className='sentinel-ai-card' disabled={running}>
++                                <legend>Execution mode</legend>
++                                <div className='sentinel-ai-segment' role='radiogroup' aria-label='Execution mode'>
++                                    {EXECUTION_OPTIONS.map(option => (
++                                        <button
++                                            key={option.value}
++                                            type='button'
++                                            role='radio'
++                                            aria-checked={settings.executionMode === option.value}
++                                            className={classNames({ 'is-on': settings.executionMode === option.value })}
++                                            onClick={() => set({ executionMode: option.value })}
++                                        >
++                                            {option.label}
++                                        </button>
++                                    ))}
++                                </div>
++                                <p className='sentinel-ai-muted'>
++                                    {EXECUTION_OPTIONS.find(option => option.value === settings.executionMode)?.hint}
++                                </p>
++                            </fieldset>
++
+                             <fieldset className='sentinel-ai-card' disabled={running}>
+                                 <legend>Stake</legend>
+                                 <div className='sentinel-ai-row'>
+diff --git a/src/sentinel-engine/lib/apex/core.ts b/src/sentinel-engine/lib/apex/core.ts
+index 9979605..a881ac2 100644
+--- a/src/sentinel-engine/lib/apex/core.ts
++++ b/src/sentinel-engine/lib/apex/core.ts
+@@ -93,6 +93,7 @@ class ApexCore {
+   private pendingCycle = false;
+   /** Rolling average cost of one cycle (ms) — drives adaptive back-off. */
+   private avgCycleMs = 0;
++  private analyseFailures = new Map<string, number>();
+ 
+ 
+   /** Deep digit history for a market (up to 5000 ticks). */
+@@ -290,7 +291,15 @@ class ApexCore {
+       this.cursor = (this.cursor + BATCH) % APEX_UNIVERSE.length;
+       for (const sym of slice) {
+         if (this.refs <= 0) break;
+-        this.analyse(sym);
++        try {
++          this.analyse(sym);
++        } catch (err) {
++          // One market throwing used to abort the whole slice (and skip its emit), so the remaining markets in
++          // it went stale for good. Contain it and carry on.
++          const n = (this.analyseFailures.get(sym) ?? 0) + 1;
++          this.analyseFailures.set(sym, n);
++          if (n === 1 || n % 50 === 0) console.warn(`[apex] analyse(${sym}) failed (${n}x):`, err);
++        }
+         // One market per task: keeps every chunk of work short instead of
+         // blocking the main thread for the whole batch.
+         await this.yieldToBrowser();
+diff --git a/src/sentinel-engine/lib/deriv/tick-bus.ts b/src/sentinel-engine/lib/deriv/tick-bus.ts
+index 16bbe2f..a1d74a2 100644
+--- a/src/sentinel-engine/lib/deriv/tick-bus.ts
++++ b/src/sentinel-engine/lib/deriv/tick-bus.ts
+@@ -12,7 +12,15 @@ class DerivTickBus{
+  private setBuffer(s:string,t:Tick[]){const x=t.slice(-MAX_BUFFER);this.buffers.set(s,x);this.digits.set(s,x.map(v=>this.digit(s,v.price)));this.lastEpoch.set(s,x.length?Math.floor(x[x.length-1].t/1000):0)}
+  private append(s:string,t:Tick){const b=this.buffers.get(s)||[];b.push(t);if(b.length>MAX_BUFFER)b.splice(0,b.length-MAX_BUFFER);this.buffers.set(s,b);const d=this.digits.get(s)||[];d.push(this.digit(s,t.price));if(d.length>MAX_BUFFER)d.splice(0,d.length-MAX_BUFFER);this.digits.set(s,d);this.lastEpoch.set(s,Math.floor(t.t/1000));}
+  subscribe(symbols:string[]){const unique=[...new Set(symbols)];for(const s of unique){this.refs.set(s,(this.refs.get(s)||0)+1);if((this.refs.get(s)||0)===1) void this.seed(s)} this.setStatus("live"); return()=>{for(const s of unique){const n=(this.refs.get(s)||1)-1;if(n<=0){this.refs.delete(s);const sub=this.subs.get(s);try{sub?.unsubscribe?.()}catch{}this.subs.delete(s)}else this.refs.set(s,n)}}}
+- private async seed(s:string){if(!api_base.api){this.setStatus("error");return}this.setStatus("connecting");try{const r:any=await api_base.api.send({ticks_history:s,adjust_start_time:1,count:MAX_BUFFER,end:"latest",style:"ticks"});if(r?.history?.prices){const times=r.history.times||[];this.setBuffer(s,r.history.prices.map((p:number,i:number)=>({t:Number(times[i])*1000,price:Number(p)})));this.histLs.forEach(f=>f(s,this.getTicks(s)));}const sub:any=api_base.api.send({ticks:s,subscribe:1});this.subs.set(s,sub);if(sub?.then) {const resolved=await sub; this.subs.set(s,resolved?.subscription||resolved)} const stream=this.subs.get(s); if(stream?.unsubscribe){/* API stream owns callbacks internally; onMessage is used below */} this.attachMessageListener();}catch{this.setStatus("error")}}
++ private seedTries=new Map<string,number>();
++ /** A failed seed used to leave the market dead for good. Retry with back-off while someone still subscribes to it. */
++ private retrySeed(s:string){const n=(this.seedTries.get(s)||0)+1;this.seedTries.set(s,n);if(n>6)return;setTimeout(()=>{if(this.refs.has(s))void this.seed(s)},Math.min(30000,1500*n*n))}
++ /**
++  * Re-establishes every live tick subscription on the CURRENT socket: forgets the old stream ids, then re-seeds.
++  * Use when the feed went quiet (dropped subscription / reconnect) but nothing errored.
++  */
++ async resync(){const api:any=api_base.api;if(!api)return;try{this.messageUnsub?.unsubscribe();}catch{}this.messageUnsub=null;for(const s of [...this.refs.keys()]){const id=this.subs.get(s)?.id;this.subs.delete(s);this.seedTries.delete(s);if(id){try{await api.send({forget:id})}catch{}}void this.seed(s)}}
++ private async seed(s:string){if(!api_base.api){this.setStatus("error");this.retrySeed(s);return}this.setStatus("connecting");try{const r:any=await api_base.api.send({ticks_history:s,adjust_start_time:1,count:MAX_BUFFER,end:"latest",style:"ticks"});if(r?.history?.prices){const times=r.history.times||[];this.setBuffer(s,r.history.prices.map((p:number,i:number)=>({t:Number(times[i])*1000,price:Number(p)})));this.histLs.forEach(f=>f(s,this.getTicks(s)));}const sub:any=api_base.api.send({ticks:s,subscribe:1});this.subs.set(s,sub);if(sub?.then) {const resolved=await sub; this.subs.set(s,resolved?.subscription||resolved)} const stream=this.subs.get(s); if(stream?.unsubscribe){/* API stream owns callbacks internally; onMessage is used below */} this.attachMessageListener();this.seedTries.delete(s);}catch{this.setStatus("error");this.retrySeed(s)}}
+  private messageUnsub:{unsubscribe:()=>void}|null=null;
+  private attachMessageListener(){if(this.messageUnsub||!api_base.api)return;this.messageUnsub=api_base.api.onMessage().subscribe((msg:any)=>{const m=msg?.data||msg;if(m?.msg_type!=="tick"||!m.tick)return;const s=String(m.tick.symbol||"");if(!this.refs.has(s))return;const epoch=Number(m.tick.epoch),price=Number(m.tick.quote);if(!s||!Number.isFinite(epoch)||!Number.isFinite(price))return;if(epoch<=(this.lastEpoch.get(s)||0))return;if(m.tick.pip_size!==undefined)this.pip.set(s,Number(m.tick.pip_size));const t={t:epoch*1000,price};this.append(s,t);this.tickLs.forEach(f=>f(s,t));});}
+  getDiagnostics(){let n=0;for(const b of this.buffers.values())n+=b.length;return{status:this.status,subscribedSymbols:this.refs.size,bufferedSymbols:this.buffers.size,bufferedTicks:n,lastTickAt:Math.max(...[0,...this.lastEpoch.values()].map(x=>x*1000))}}
+diff --git a/src/utils/__tests__/trade-errors.test.ts b/src/utils/__tests__/trade-errors.test.ts
+new file mode 100644
+index 0000000..9d623af
+--- /dev/null
++++ b/src/utils/__tests__/trade-errors.test.ts
+@@ -0,0 +1,32 @@
++import { classifyApiError, describeTradeFailure, TradeRequestError } from '@/utils/trade-errors';
++
++describe('trade error classification', () => {
++    it('treats InvalidContractProposal as a refused contract, not a session-ending error', () => {
++        expect(classifyApiError('InvalidContractProposal', 'Unknown contract proposal')).toBe('rejected');
++        const failure = describeTradeFailure({ error: { code: 'InvalidContractProposal', message: 'Unknown contract proposal' } });
++        expect(failure.kind).toBe('rejected');
++        expect(failure.message).toBe('Unknown contract proposal (InvalidContractProposal)');
++        expect(failure.outcomeUnknown).toBe(false);
++    });
++
++    it('recognises the already-formatted message from older callers', () => {
++        expect(describeTradeFailure(new Error('Unknown contract proposal (InvalidContractProposal)')).kind).toBe('rejected');
++    });
++
++    it('treats account problems as fatal', () => {
++        expect(describeTradeFailure({ error: { code: 'InsufficientBalance', message: 'Low funds' } }).kind).toBe('fatal');
++        expect(describeTradeFailure(new Error('Please log in to your Deriv account')).kind).toBe('fatal');
++    });
++
++    it('treats unknown failures as transient', () => {
++        expect(describeTradeFailure(new Error('socket closed')).kind).toBe('transient');
++        expect(describeTradeFailure('boom').message).toBe('Contract purchase failed.');
++    });
++
++    it('keeps the outcome-unknown flag from a timed-out purchase', () => {
++        const error = new TradeRequestError('timed out', { stage: 'buy', kind: 'timeout', outcomeUnknown: true });
++        const failure = describeTradeFailure(error);
++        expect(failure.kind).toBe('timeout');
++        expect(failure.outcomeUnknown).toBe(true);
++    });
++});
+diff --git a/src/utils/__tests__/trade-purchase.test.ts b/src/utils/__tests__/trade-purchase.test.ts
+new file mode 100644
+index 0000000..a79263c
+--- /dev/null
++++ b/src/utils/__tests__/trade-purchase.test.ts
+@@ -0,0 +1,58 @@
++import { api_base } from '@/external/bot-skeleton';
++import { TradeRequestError } from '@/utils/trade-errors';
++import { buyContractForUi } from '@/utils/trade-purchase';
++
++jest.mock('@/external/bot-skeleton', () => ({ api_base: { api: { send: jest.fn() } } }));
++
++const send = () => (api_base as any).api.send as jest.Mock;
++const params = { amount: 1, contract_type: 'DIGITUNDER', symbol: 'JD50', barrier: 8 };
++const apiError = (code: string, message: string) => ({ error: { code, message } });
++
++describe('buyContractForUi', () => {
++    beforeEach(() => send().mockReset());
++
++    it('requests a fresh proposal and buys it', async () => {
++        send()
++            .mockResolvedValueOnce({ proposal: { id: 'p1' } })
++            .mockResolvedValueOnce({ buy: { buy_price: 1, contract_id: 7, transaction_id: 9 } });
++        const result = await buyContractForUi({ parameters: params, price: 1 });
++        expect(result.contract_id).toBe(7);
++        expect(send().mock.calls[0][0].underlying_symbol).toBe('JD50');
++        expect(send().mock.calls[1][0]).toEqual({ buy: 'p1', price: 1 });
++    });
++
++    it('reports a refused proposal as a rejection', async () => {
++        send().mockRejectedValueOnce(apiError('InvalidContractProposal', 'Unknown contract proposal'));
++        await expect(buyContractForUi({ parameters: params, price: 1 })).rejects.toMatchObject({
++            kind: 'rejected',
++            stage: 'proposal',
++            code: 'InvalidContractProposal',
++        });
++        expect(send().mock.calls.length).toBe(1);
++    });
++
++    it('retries ONCE with a fresh proposal when Deriv explicitly rejects the buy as unknown', async () => {
++        send()
++            .mockResolvedValueOnce({ proposal: { id: 'p1' } })
++            .mockRejectedValueOnce(apiError('InvalidContractProposal', 'Unknown contract proposal'))
++            .mockResolvedValueOnce({ proposal: { id: 'p2' } })
++            .mockResolvedValueOnce({ buy: { buy_price: 1, contract_id: 8, transaction_id: 10 } });
++        const result = await buyContractForUi({ parameters: params, price: 1 });
++        expect(result.contract_id).toBe(8);
++        expect(send().mock.calls[3][0].buy).toBe('p2');
++    });
++
++    it('never retries a buy that timed out: the contract may exist', async () => {
++        jest.useFakeTimers();
++        send()
++            .mockResolvedValueOnce({ proposal: { id: 'p1' } })
++            .mockImplementationOnce(() => new Promise(() => undefined));
++        const pending = buyContractForUi({ parameters: params, price: 1 });
++        const assertion = expect(pending).rejects.toMatchObject({ kind: 'timeout', stage: 'buy', outcomeUnknown: true });
++        await jest.advanceTimersByTimeAsync(16_000);
++        await assertion;
++        expect(send().mock.calls.length).toBe(2);
++        expect(await pending.catch(e => e)).toBeInstanceOf(TradeRequestError);
++        jest.useRealTimers();
++    });
++});
+diff --git a/src/utils/trade-errors.ts b/src/utils/trade-errors.ts
+new file mode 100644
+index 0000000..2d27047
+--- /dev/null
++++ b/src/utils/trade-errors.ts
+@@ -0,0 +1,87 @@
++// Shared classification of Deriv trade-request failures.
++//
++// Why this exists: a rejected contract (e.g. `InvalidContractProposal`: Deriv does not offer that contract right
++// now), a request that never answered (outcome UNKNOWN: it may or may not have been bought) and a fatal account
++// problem all need different handling. Treating them alike either stopped whole sessions over one bad signal, or
++// risked buying a second contract after a timeout.
++
++export type TradeStage = 'proposal' | 'buy' | 'request';
++
++/** What the caller should do next. */
++export type TradeFailureKind =
++    /** Deriv explicitly refused this contract. Nothing was bought. Skip this signal, keep the session alive. */
++    | 'rejected'
++    /** No answer in time. For `buy` the contract MAY exist: never retry blindly. */
++    | 'timeout'
++    /** Account / balance / permission problem. Retrying cannot help. Stop. */
++    | 'fatal'
++    /** Anything else (network blip, rate limit). Safe to try again later. */
++    | 'transient';
++
++export class TradeRequestError extends Error {
++    readonly stage: TradeStage;
++    readonly kind: TradeFailureKind;
++    readonly code?: string;
++    /** True only when a purchase was sent and we do not know whether it went through. */
++    readonly outcomeUnknown: boolean;
++
++    constructor(
++        message: string,
++        options: { stage: TradeStage; kind: TradeFailureKind; code?: string; outcomeUnknown?: boolean }
++    ) {
++        super(message);
++        this.name = 'TradeRequestError';
++        this.stage = options.stage;
++        this.kind = options.kind;
++        this.code = options.code;
++        this.outcomeUnknown = Boolean(options.outcomeUnknown);
++    }
++}
++
++/** Deriv error codes that mean "this exact contract cannot be offered / bought right now". Nothing was bought. */
++export const REJECTED_CODES = new Set([
++    'InvalidContractProposal',
++    'OfferingsValidationError',
++    'ContractCreationFailure',
++    'ContractBuyValidationError',
++    'MarketIsClosed',
++    'InvalidSymbol',
++    'InvalidtoBuy',
++    'PriceMoved',
++    'ProposalExpired',
++]);
++
++/** Deriv error codes that cannot be fixed by retrying: stop the session. */
++export const FATAL_CODES = new Set([
++    'InvalidToken',
++    'AuthorizationRequired',
++    'AccountDisabled',
++    'PermissionDenied',
++    'InsufficientBalance',
++    'TradingDisabled',
++]);
++
++export const FATAL_MESSAGE = /balance|authori[sz]|not logged|log in|insufficient|account|permission/i;
++export const REJECTED_MESSAGE = /unknown contract proposal|invalid ?contract ?proposal|not offered|market is presently closed/i;
++
++export const classifyApiError = (code: string | undefined, message: string): TradeFailureKind => {
++    if (code && FATAL_CODES.has(code)) return 'fatal';
++    if (code && REJECTED_CODES.has(code)) return 'rejected';
++    if (REJECTED_MESSAGE.test(message)) return 'rejected';
++    if (FATAL_MESSAGE.test(message)) return 'fatal';
++    return 'transient';
++};
++
++export type TradeFailure = { kind: TradeFailureKind; message: string; outcomeUnknown: boolean };
++
++/** Works for TradeRequestError, plain Errors and Deriv's raw `{ error: { code, message } }` rejections. */
++export const describeTradeFailure = (error: unknown, fallback = 'Contract purchase failed.'): TradeFailure => {
++    if (error instanceof TradeRequestError) {
++        return { kind: error.kind, message: error.message, outcomeUnknown: error.outcomeUnknown };
++    }
++    const raw = error as { error?: { code?: string; message?: string }; message?: string; code?: string } | null;
++    const code = raw?.error?.code ?? raw?.code;
++    const text = error instanceof Error && error.message ? error.message : raw?.error?.message || raw?.message || fallback;
++    const message = code && !text.includes(code) ? `${text} (${code})` : text;
++    return { kind: classifyApiError(code, message), message, outcomeUnknown: false };
++};
+diff --git a/src/utils/trade-purchase.ts b/src/utils/trade-purchase.ts
+index b4bc0d3..47ffd93 100644
+--- a/src/utils/trade-purchase.ts
++++ b/src/utils/trade-purchase.ts
+@@ -1,4 +1,5 @@
+ import { api_base } from '@/external/bot-skeleton';
++import { classifyApiError, TradeRequestError, type TradeStage } from './trade-errors';
+ 
+ type TradeParameters = Record<string, any>;
+ 
+@@ -27,14 +28,52 @@ export const getErrorMessage = (err: unknown, fallback: string): string => {
+     return fallback;
+ };
+ 
+-const sendRequest = async (request: Record<string, any>) => {
++/** A request that gets no answer must not leave the UI (or a trading session) waiting forever. */
++export const TRADE_REQUEST_TIMEOUT_MS = 15_000;
++
++const sendRequest = async (request: Record<string, any>, stage: TradeStage, timeoutMs = TRADE_REQUEST_TIMEOUT_MS) => {
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    const timeout = new Promise<never>((_, reject) => {
++        timer = setTimeout(() => {
++            const sentBuy = stage === 'buy';
++            reject(
++                new TradeRequestError(
++                    sentBuy
++                        ? 'Purchase request timed out. The result is unknown: check your Deriv statement before trading again.'
++                        : `Deriv did not answer the ${stage} request in time.`,
++                    { stage, kind: 'timeout', outcomeUnknown: sentBuy }
++                )
++            );
++        }, timeoutMs);
++    });
+     try {
+-        return await (api_base.api as any).send(request);
++        return await Promise.race([(api_base.api as any).send(request), timeout]);
+     } catch (err) {
+-        throw new Error(getErrorMessage(err, 'Deriv request failed.'));
++        if (err instanceof TradeRequestError) throw err;
++        const candidate = err as { error?: { code?: string } ; code?: string } | null;
++        const code = candidate?.error?.code ?? candidate?.code;
++        const message = getErrorMessage(err, 'Deriv request failed.');
++        throw new TradeRequestError(message, { stage, kind: classifyApiError(code, message), code });
++    } finally {
++        if (timer) clearTimeout(timer);
+     }
+ };
+ 
++const raiseIfError = (response: any, stage: TradeStage, fallback: string) => {
++    if (!response?.error) return;
++    const code: string | undefined = response.error.code;
++    const message = response.error.message || fallback;
++    const text = code && !message.includes(code) ? `${message} (${code})` : message;
++    throw new TradeRequestError(text, { stage, kind: classifyApiError(code, text), code });
++};
++
++/**
++ * Proposal -> buy. A fresh proposal is requested for every purchase and bought immediately, so a quote can never go
++ * stale while the caller waits for an entry point.
++ *
++ * Retry rule: if Deriv EXPLICITLY answers the buy with "unknown / expired proposal" the contract was not bought, so one
++ * retry with a fresh proposal is safe. A buy that times out is never retried (it may have been bought).
++ */
+ export const buyContractForUi = async ({
+     parameters,
+     price,
+@@ -43,24 +82,41 @@ export const buyContractForUi = async ({
+     price: number;
+     source?: string;
+ }) => {
+-    if (!api_base.api) throw new Error('Deriv connection is not ready yet.');
+-
+-    const proposalResponse = await sendRequest({
+-        proposal: 1,
+-        ...normalizeTradeParameters(parameters),
+-    });
+-
+-    if (proposalResponse?.error) throw new Error(proposalResponse.error.message || 'Proposal request failed.');
+-
+-    const proposalId = proposalResponse?.proposal?.id;
+-    if (!proposalId) throw new Error('No proposal id was returned for this contract.');
++    if (!api_base.api) throw new TradeRequestError('Deriv connection is not ready yet.', { stage: 'request', kind: 'transient' });
++
++    const attempt = async () => {
++        const proposalResponse = await sendRequest(
++            { proposal: 1, ...normalizeTradeParameters(parameters) },
++            'proposal'
++        );
++        raiseIfError(proposalResponse, 'proposal', 'Proposal request failed.');
++
++        const proposalId = proposalResponse?.proposal?.id;
++        if (!proposalId) {
++            throw new TradeRequestError('No proposal id was returned for this contract.', {
++                stage: 'proposal',
++                kind: 'rejected',
++            });
++        }
+ 
+-    const buyResponse = await sendRequest({
+-        buy: proposalId,
+-        price,
+-    });
++        const buyResponse = await sendRequest({ buy: proposalId, price }, 'buy');
++        raiseIfError(buyResponse, 'buy', 'Contract purchase failed.');
++        return buyResponse;
++    };
+ 
+-    if (buyResponse?.error) throw new Error(buyResponse.error.message || 'Contract purchase failed.');
++    let buyResponse: any;
++    try {
++        buyResponse = await attempt();
++    } catch (error) {
++        const retriable =
++            error instanceof TradeRequestError &&
++            error.stage === 'buy' &&
++            error.kind === 'rejected' &&
++            !error.outcomeUnknown &&
++            (error.code === 'InvalidContractProposal' || error.code === 'ProposalExpired');
++        if (!retriable) throw error;
++        buyResponse = await attempt();
++    }
+ 
+     return {
+         buy_price: Number(buyResponse?.buy?.buy_price ?? price),
